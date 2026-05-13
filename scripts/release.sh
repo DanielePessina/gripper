@@ -12,8 +12,8 @@
 #      the precompiled tarballs (no `go => :build` dep).
 #   6. Pushes the tap.
 #
-# Run from the gripper repo root, on a tagged commit. Requires bash 4+ (brew
-# install bash if you're on stock macOS), gh (authenticated), go, git.
+# Run from the gripper repo root, on a tagged commit. Requires gh (authenticated),
+# go, and git. Works with the bash 3.2 that ships on macOS.
 #
 # Typical usage:
 #   git tag v0.2.0
@@ -33,11 +33,6 @@ PLATFORMS=(
 )
 
 # ---------- preflight ----------
-
-if (( BASH_VERSINFO[0] < 4 )); then
-  echo "Error: this script needs bash 4+. Run: brew install bash" >&2
-  exit 1
-fi
 
 for tool in go gh git tar shasum mktemp; do
   command -v "$tool" >/dev/null 2>&1 || {
@@ -83,7 +78,10 @@ DIST=dist
 rm -rf "$DIST"
 mkdir -p "$DIST"
 
-declare -A SHAS
+SHA_DARWIN_ARM64=""
+SHA_DARWIN_AMD64=""
+SHA_LINUX_ARM64=""
+SHA_LINUX_AMD64=""
 
 for plat in "${PLATFORMS[@]}"; do
   GOOS="${plat%/*}"
@@ -106,7 +104,12 @@ for plat in "${PLATFORMS[@]}"; do
   tar -czf "$TARBALL" -C "$STAGE" .
 
   SHA=$(shasum -a 256 "$TARBALL" | awk '{print $1}')
-  SHAS["$PLATKEY"]="$SHA"
+  case "$plat" in
+    darwin/arm64) SHA_DARWIN_ARM64="$SHA" ;;
+    darwin/amd64) SHA_DARWIN_AMD64="$SHA" ;;
+    linux/arm64)  SHA_LINUX_ARM64="$SHA" ;;
+    linux/amd64)  SHA_LINUX_AMD64="$SHA" ;;
+  esac
   echo "  -> $(basename "$TARBALL") ($SHA)"
 done
 
@@ -166,20 +169,20 @@ class Gripper < Formula
   on_macos do
     if Hardware::CPU.arm?
       url "https://github.com/$REPO/releases/download/$TAG/gripper_${VERSION}_darwin_arm64.tar.gz"
-      sha256 "${SHAS[darwin_arm64]}"
+      sha256 "$SHA_DARWIN_ARM64"
     else
       url "https://github.com/$REPO/releases/download/$TAG/gripper_${VERSION}_darwin_amd64.tar.gz"
-      sha256 "${SHAS[darwin_amd64]}"
+      sha256 "$SHA_DARWIN_AMD64"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
       url "https://github.com/$REPO/releases/download/$TAG/gripper_${VERSION}_linux_arm64.tar.gz"
-      sha256 "${SHAS[linux_arm64]}"
+      sha256 "$SHA_LINUX_ARM64"
     else
       url "https://github.com/$REPO/releases/download/$TAG/gripper_${VERSION}_linux_amd64.tar.gz"
-      sha256 "${SHAS[linux_amd64]}"
+      sha256 "$SHA_LINUX_AMD64"
     end
   end
 
