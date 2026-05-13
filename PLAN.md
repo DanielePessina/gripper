@@ -44,7 +44,9 @@ gripper torvalds/linux --force
    - `--bind 'space:toggle'`
    - `--bind 'ctrl-a:select-all,ctrl-d:deselect-all'`
    - `--header` line with keys + selection count
-   - No preview pane in v1.0 (added in v1.1).
+   - `--preview` pane:
+     - For file entries: head of file content via `gh api .../contents/PATH`, base64-decoded. Skip with `(binary file)` if content fails the printability check.
+     - For folder entries: list of direct children with sizes, computed in-memory from `tree.json` (no extra API call).
 8. **Expand selection.** For each selected line that is a folder, replace it with every blob whose path starts with that prefix; dedupe.
 9. **Download tarball.** `gh api repos/$o/$r/tarball/$ref > $tmp/repo.tgz`. Print `Downloading tarball (~XX MB)...` upfront.
 10. **Extract selected files.** Peek tarball's top-level dir via `tar -tzf $tmp/repo.tgz | head -1`, build `files-from.txt` by prepending that prefix to each selected path, then:
@@ -70,42 +72,11 @@ gripper torvalds/linux --force
 
 ## Auth & secrets
 
-### Default path: `gh auth login`
+gripper delegates all auth to `gh`. `gh auth login` stores the token in the **macOS keychain** by default — already a secrets manager — and gripper reads it via `gh auth token` when downloading the tarball.
 
-`gh` stores its OAuth/PAT token in the **macOS keychain** by default — already a secrets manager. For most users, `gh auth login` is the full setup.
+For private repos: `gh auth login` with the `repo` scope. No gripper-specific setup.
 
-For private repos: same flow. `gh auth login` with the `repo` scope grants access to private repositories.
-
-### Override path: `GITHUB_TOKEN` env var
-
-For users who want to manage their PAT in a specific secrets manager (1Password, `pass`, Bitwarden, Vault, etc.):
-
-- gripper checks `GITHUB_TOKEN` first. If set, it's exported as `GH_TOKEN` before invoking `gh` (gh respects this env var and uses it instead of stored creds).
-- Populate it from your manager of choice in your shell:
-
-  ```bash
-  # 1Password CLI
-  export GITHUB_TOKEN="$(op read 'op://Personal/GitHub PAT/credential')"
-
-  # macOS keychain (manual entry)
-  export GITHUB_TOKEN="$(security find-generic-password -a "$USER" -s github-pat -w)"
-
-  # pass
-  export GITHUB_TOKEN="$(pass show github/pat)"
-
-  # Bitwarden
-  export GITHUB_TOKEN="$(bw get password github-pat)"
-  ```
-
-- Recommended scopes for the PAT: `repo` (private repo read), nothing else for read-only use.
-
-### What gripper does NOT do
-
-- Does not store tokens itself.
-- Does not prompt for tokens interactively.
-- Does not implement its own OAuth flow.
-
-This keeps gripper free of credential-handling code; all secrets logic delegates to `gh` or the user's shell.
+gripper does not store tokens, does not prompt for tokens, and does not implement its own OAuth flow. A future version may add a `GITHUB_TOKEN` env-var override if a use case appears for keeping tokens in a different secrets manager.
 
 ## Phase 1 deliverables
 
@@ -119,17 +90,59 @@ This keeps gripper free of credential-handling code; all secrets logic delegates
 
 Order of work: build locally → symlink to `~/.local/bin` → use for a week → if it sticks, publish + tap formula.
 
-## Phase 2: real TUI with collapse (later)
+## Phase 2: real TUI with collapse + path remapping
 
-- **Language:** Go + Bubbletea — single static binary, brew-friendly, no runtime dependency on user's machine.
-- **Alternative considered:** TypeScript + OpenTUI + trees.software. Polished tree widget but distribution requires Bun or bundling.
-- **Same backend** as Phase 1 (gh API tree fetch, tarball extract).
-- **Tree widget behavior:**
-  - Hierarchical, arrow-key nav, right-arrow to expand, left to collapse, space to toggle.
-  - Folder toggle propagates to all descendants.
-  - Parent shows partial-selection marker `[~]` when only some children are selected.
-- **Trigger to build:** the moment fzf's flat list becomes friction on a real task. Don't pre-build.
-- **Coexistence:** brew tap ships both `gripper` (shell) and `gripper-tui` (binary).
+### Stack
+
+- Go + Bubbletea (single static binary, brew-friendly).
+- `lipgloss` for styling, `bubbles/textinput` and `bubbles/viewport` for inline edit + scrollable preview. No third-party tree widget — tree rendering is ~150 LOC of lipgloss.
+- Native `net/http` to GitHub API; auth token via `exec("gh auth token")` once at startup. Stdlib `archive/tar` + `compress/gzip` for extraction. No `curl`/`tar` runtime deps.
+
+### Naming
+
+- Go binary becomes **`gripper`** (the headline tool).
+- Shell script is renamed **`gripper-sh`** at ship time (kept as fallback).
+- During development they coexist: shell at `bin/gripper`, Go binary at `cmd/gripper-tui/`. Rename happens when v2 is verified.
+
+### Two screens
+
+**Tree screen** (entry point):
+- Left pane: collapsible tree with checkboxes. `[ ]` unchecked, `[x]` checked, `[~]` partial (some descendants checked).
+- Right pane: same preview pane as v1 — file head for blobs, direct-children listing for folders.
+- Bottom statusbar: `Selected: N files, X MB | / filter  ? help  enter confirm  q quit`.
+- Keys: `↑/↓` nav, `→` expand, `←` collapse, `space` toggle (cascades to descendants; updates ancestor partial state), `enter` go to review screen, `/` filter, `q` quit.
+
+**Review screen** (after enter on tree):
+- Rows: `SOURCE → TARGET   SIZE`. Each blob in the selection has an editable target path.
+- Collision warnings inline: row turns red, suffix `← collides with row N`.
+- Top-of-screen field: output base dir (default `./<repo>/`, editable).
+- Keys:
+  - `e` or `enter` — edit the current row's target inline (textinput pops in).
+  - `s` — strip longest common prefix from all targets (tar `--strip-components` style).
+  - `f` — flatten: replace every target with its basename.
+  - `r` — reset all targets to source paths.
+  - `x` — drop the current row from the selection.
+  - `o` — edit output base dir.
+  - `c` — confirm and download (refuses if collisions present and `--force-collisions` not set).
+  - `esc` — back to tree screen, preserving selections + edits.
+
+### Repo layout
+
+```
+cmd/gripper-tui/main.go        # entry; ~30 LOC
+cmd/gripper-tui/gh.go          # GitHub API + tarball download/extract
+cmd/gripper-tui/tree.go        # tree model + selection cascade
+cmd/gripper-tui/remap.go       # LCP strip, flatten, collision detection
+cmd/gripper-tui/ui.go          # Bubbletea Model + both screens
+go.mod / go.sum
+```
+
+### What we still defer to v2.1+
+
+- Lazy per-folder fetch for truncated trees.
+- Mouse support.
+- Saved profiles (named selection presets).
+- Re-run with lockfile for updates.
 
 ## Out of scope (and why)
 

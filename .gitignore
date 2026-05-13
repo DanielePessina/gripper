@@ -3,3 +3,11 @@
 *~
 .vscode/
 .idea/
+
+# Go build artifacts
+/bin/gripper-tui
+
+# Claude Code / harness state
+.claude/
+.agents/
+skills-lock.json
