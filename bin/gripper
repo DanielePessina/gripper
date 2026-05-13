@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# gripper - interactive picker for selectively downloading files and folders
+# from a GitHub repository, without cloning history.
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  gripper <owner/repo|github-url>[#ref] [target-dir] [--force] [--dry-run]
+
+Interactively pick files and folders from a GitHub repository and download
+them, preserving paths. No git history is fetched.
+
+Arguments:
+  owner/repo[#ref]   Repo slug. Optional #ref (branch, tag, or SHA).
+                     URL forms also accepted: https://github.com/owner/repo
+  target-dir         Where files land. Default: ./<repo>/
+
+Options:
+  --force            Allow non-empty target dir; overwrite conflicting files.
+  --dry-run          Print what would be downloaded and exit.
+  -h, --help         Show this help.
+
+Auth:
+  Uses `gh auth login`. Run `gh auth login` once with the `repo` scope.
+
+Examples:
+  gripper torvalds/linux
+  gripper torvalds/linux#v6.5 ./kernel-stuff/
+  gripper https://github.com/sst/opentui examples/
+USAGE
+}
+
+# ---------- arg parsing ----------
+spec=""
+target=""
+force=0
+dry_run=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --force) force=1; shift ;;
+    --dry-run) dry_run=1; shift ;;
+    --) shift; break ;;
+    -*) echo "Unknown flag: $1" >&2; usage >&2; exit 1 ;;
+    *)
+      if [[ -z "$spec" ]]; then spec="$1"
+      elif [[ -z "$target" ]]; then target="$1"
+      else echo "Unexpected positional arg: $1" >&2; exit 1
+      fi
+      shift ;;
+  esac
+done
+
+[[ -z "$spec" ]] && { usage >&2; exit 1; }
+
+# ---------- preflight ----------
+for tool in gh fzf jq tar curl; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "Error: required tool '$tool' not on PATH." >&2
+    echo "Install: brew install gh fzf jq" >&2
+    exit 1
+  }
+done
+
+if ! gh auth status >/dev/null 2>&1; then
+  echo "Error: not authenticated to GitHub. Run: gh auth login" >&2
+  exit 1
+fi
+
+# ---------- parse spec ----------
+spec="${spec#https://github.com/}"
+spec="${spec#http://github.com/}"
+spec="${spec%.git}"
+spec="${spec%/}"
+
+ref=""
+if [[ "$spec" == *"#"* ]]; then
+  ref="${spec##*#}"
+  spec="${spec%#*}"
+fi
+
+if [[ ! "$spec" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+  echo "Error: invalid repo spec '$spec'." >&2
+  echo "Expected: owner/repo or https://github.com/owner/repo" >&2
+  exit 1
+fi
+
+owner="${spec%/*}"
+repo="${spec#*/}"
+[[ -z "$target" ]] && target="./$repo"
+
+# ---------- target collision ----------
+if [[ $dry_run -eq 0 ]] && [[ -d "$target" ]] && \
+   [[ -n "$(ls -A "$target" 2>/dev/null || true)" ]] && [[ $force -eq 0 ]]; then
+  echo "Error: target '$target' is not empty." >&2
+  echo "Use --force to allow overwriting conflicting files." >&2
+  exit 1
+fi
+
+# ---------- temp dir ----------
+tmp=$(mktemp -d -t gripper.XXXXXXXX)
+trap 'rm -rf "$tmp"' EXIT
+
+# ---------- resolve ref ----------
+if [[ -z "$ref" ]]; then
+  ref=$(gh api "repos/$owner/$repo" --jq .default_branch 2>/dev/null) || {
+    echo "Error: could not access $owner/$repo (check repo name and auth)." >&2
+    exit 1
+  }
+fi
+
+# ---------- fetch tree ----------
+echo "Fetching tree for $owner/$repo @ $ref ..." >&2
+gh api "repos/$owner/$repo/git/trees/$ref?recursive=1" > "$tmp/tree.json"
+
+truncated=$(jq -r '.truncated' "$tmp/tree.json")
+if [[ "$truncated" == "true" ]]; then
+  echo "Error: tree for $owner/$repo exceeds GitHub's recursive limit" >&2
+  echo "(over 100k entries or 7MB). Lazy fetch is a future feature." >&2
+  exit 1
+fi
+
+# ---------- build display list ----------
+# Format per line: "[D] <size>  <path>/" or "[F] <size>  <path>".
+# Path starts at column 19 (3 + 1 + 12 + 2 + 1, 1-indexed).
+jq -r '.tree[] | [.type, .path, (.size // 0)] | @tsv' "$tmp/tree.json" |
+awk -F'\t' '
+  function human(s) {
+    if (s < 1024) return sprintf("%d B", s)
+    s /= 1024; if (s < 1024) return sprintf("%.1f KB", s)
+    s /= 1024; if (s < 1024) return sprintf("%.1f MB", s)
+    s /= 1024; return sprintf("%.1f GB", s)
+  }
+  $1 == "blob" {
+    blob_size[$2] = $3
+    n = split($2, parts, "/")
+    pref = ""
+    for (i = 1; i < n; i++) {
+      pref = (pref == "" ? parts[i] : pref "/" parts[i])
+      folder_size[pref] += $3
+    }
+  }
+  $1 == "tree" { folders[$2] = 1 }
+  END {
+    for (p in folders) printf "[D] %12s  %s/\n", human(folder_size[p] + 0), p
+    for (p in blob_size) printf "[F] %12s  %s\n", human(blob_size[p]), p
+  }
+' |
+# Sort by path (everything from column 19 onward); use a tab-joined sort key
+# so paths with spaces don't break sort field-splitting.
+awk '{ key = substr($0, 19); print key "\t" $0 }' | sort | cut -f2- > "$tmp/list.txt"
+
+if [[ ! -s "$tmp/list.txt" ]]; then
+  echo "Error: $owner/$repo @ $ref appears to have no files." >&2
+  exit 1
+fi
+
+# ---------- preview script ----------
+cat > "$tmp/preview.sh" <<PREVIEW_EOF
+#!/usr/bin/env bash
+set -e
+line="\$1"
+path="\${line:18}"
+owner="$owner"
+repo="$repo"
+ref="$ref"
+tree="$tmp/tree.json"
+
+if [[ "\$path" == */ ]]; then
+  echo "DIR: \$path"
+  echo
+  jq -r --arg p "\$path" '
+    [.tree[] | select(
+      (.path | startswith(\$p)) and
+      ((.path | sub(\$p; "") | split("/") | length) == 1)
+    )]
+    | sort_by(.path)
+    | .[]
+    | if .type == "tree"
+      then "  [D]  " + (.path | sub(\$p; "")) + "/"
+      else "  [F]  " + ((.size // 0) | tostring) + "B  " + (.path | sub(\$p; ""))
+      end
+  ' "\$tree" | head -60
+else
+  echo "FILE: \$path"
+  echo
+  content=\$(gh api "repos/\$owner/\$repo/contents/\$path?ref=\$ref" --jq '.content // ""' 2>/dev/null || echo "")
+  if [[ -z "\$content" ]]; then
+    echo "(file too large or inaccessible via contents API)"
+    exit 0
+  fi
+  decoded=\$(printf '%s' "\$content" | base64 -d 2>/dev/null || true)
+  nonprint=\$(printf '%s' "\$decoded" | head -c 4000 | tr -d '[:print:][:space:]' | wc -c | tr -d ' ')
+  if [[ "\$nonprint" -gt 50 ]]; then
+    echo "(binary file)"
+  else
+    printf '%s' "\$decoded" | head -80
+  fi
+fi
+PREVIEW_EOF
+chmod +x "$tmp/preview.sh"
+
+# ---------- fzf ----------
+header="space: toggle | ctrl-a: all | ctrl-d: none | enter: download | esc: cancel"
+
+set +e
+selected=$(fzf \
+  --multi \
+  --reverse \
+  --header="$header" \
+  --bind 'space:toggle' \
+  --bind 'ctrl-a:select-all' \
+  --bind 'ctrl-d:deselect-all' \
+  --preview "$tmp/preview.sh {}" \
+  --preview-window='right:50%:wrap' \
+  --prompt="$owner/$repo@$ref > " \
+  < "$tmp/list.txt")
+fzf_exit=$?
+set -e
+
+if [[ $fzf_exit -eq 130 ]]; then
+  exit 0  # user cancelled
+elif [[ $fzf_exit -ne 0 ]]; then
+  echo "Error: fzf exited with code $fzf_exit" >&2
+  exit 1
+fi
+
+if [[ -z "$selected" ]]; then
+  echo "Nothing selected." >&2
+  exit 0
+fi
+
+# ---------- expand folder selection ----------
+# Selected paths: extract from column 19+. Folders end in '/', files don't.
+echo "$selected" | awk '{print substr($0, 19)}' > "$tmp/selected-raw.txt"
+
+# Expand folder paths to all blob paths beneath them.
+awk -F'\t' '
+  NR == FNR { if ($1 == "blob") blobs[$2] = 1; next }
+  {
+    line = $0
+    if (substr(line, length(line), 1) == "/") {
+      pref = substr(line, 1, length(line))  # keep trailing /
+      for (b in blobs) {
+        if (substr(b, 1, length(pref)) == pref) files[b] = 1
+      }
+    } else {
+      files[line] = 1
+    }
+  }
+  END { for (f in files) print f }
+' \
+  <(jq -r '.tree[] | [.type, .path] | @tsv' "$tmp/tree.json") \
+  "$tmp/selected-raw.txt" \
+  | sort > "$tmp/selected-paths.txt"
+
+count=$(wc -l < "$tmp/selected-paths.txt" | tr -d ' ')
+if [[ "$count" -eq 0 ]]; then
+  echo "Nothing selected (after folder expansion)." >&2
+  exit 0
+fi
+
+# Total size of the selection.
+total_bytes=$(
+  awk -F'\t' '
+    NR == FNR { sz[$1] = $2; next }
+    { total += sz[$0] + 0 }
+    END { print total + 0 }
+  ' \
+  <(jq -r '.tree[] | select(.type == "blob") | [.path, (.size // 0)] | @tsv' "$tmp/tree.json") \
+  "$tmp/selected-paths.txt"
+)
+total_human=$(awk -v s="$total_bytes" 'BEGIN {
+  if (s < 1024) printf "%d B", s
+  else if (s < 1048576) printf "%.1f KB", s/1024
+  else if (s < 1073741824) printf "%.1f MB", s/1048576
+  else printf "%.1f GB", s/1073741824
+}')
+
+if [[ $dry_run -eq 1 ]]; then
+  echo "Would download $count files ($total_human) to $target/:"
+  sed 's|^|  |' "$tmp/selected-paths.txt"
+  exit 0
+fi
+
+# ---------- download tarball ----------
+echo "Downloading tarball for $owner/$repo@$ref ($count files / $total_human selected) ..." >&2
+token=$(gh auth token 2>/dev/null) || {
+  echo "Error: could not obtain auth token from gh." >&2
+  exit 1
+}
+
+curl --fail --silent --show-error --location \
+  -H "Authorization: Bearer $token" \
+  -H "Accept: application/vnd.github+json" \
+  "https://api.github.com/repos/$owner/$repo/tarball/$ref" \
+  -o "$tmp/repo.tgz"
+
+# ---------- extract ----------
+top=$(tar -tzf "$tmp/repo.tgz" | head -1 | awk -F'/' '{print $1}')
+if [[ -z "$top" ]]; then
+  echo "Error: could not determine tarball top-level directory." >&2
+  exit 1
+fi
+
+# Prepend the tarball's top-level dir to each selected path.
+sed "s|^|$top/|" "$tmp/selected-paths.txt" > "$tmp/files-from.txt"
+
+mkdir -p "$target"
+tar -xzf "$tmp/repo.tgz" -C "$target" --strip-components=1 -T "$tmp/files-from.txt"
+
+echo "Wrote $count files to $target/"
