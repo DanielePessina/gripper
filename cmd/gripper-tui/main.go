@@ -107,6 +107,7 @@ func main() {
 	if target == "" {
 		target = "./" + repo
 	}
+	target = SanitizeOutDir(target)
 
 	if !dryRun && !force {
 		if info, err := os.Stat(target); err == nil && info.IsDir() {

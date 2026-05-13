@@ -1,9 +1,41 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 )
+
+// SanitizeOutDir cleans an output directory string. Empty input becomes ".".
+func SanitizeOutDir(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "."
+	}
+	return filepath.Clean(s)
+}
+
+// SanitizeTarget normalises a per-row target path. It must be relative and
+// must not escape the output directory via `..`. Returns the cleaned path,
+// or an error describing why the input was rejected.
+func SanitizeTarget(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", fmt.Errorf("empty target")
+	}
+	cleaned := filepath.Clean(s)
+	if filepath.IsAbs(cleaned) {
+		cleaned = strings.TrimLeft(cleaned, string(filepath.Separator))
+		cleaned = filepath.Clean(cleaned)
+	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("target escapes output dir: %s", s)
+	}
+	if cleaned == "." || cleaned == "" {
+		return "", fmt.Errorf("target resolves to output dir itself")
+	}
+	return cleaned, nil
+}
 
 type Selection struct {
 	Source string

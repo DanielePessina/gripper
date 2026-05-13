@@ -194,6 +194,19 @@ func (c *Client) DownloadAndExtract(targets map[string]string, outDir string) (i
 			continue
 		}
 		full := filepath.Join(outDir, tgt)
+		// Defence in depth: ensure the resolved path stays inside outDir.
+		absOut, err := filepath.Abs(outDir)
+		if err != nil {
+			return written, err
+		}
+		absFull, err := filepath.Abs(full)
+		if err != nil {
+			return written, err
+		}
+		rel, err := filepath.Rel(absOut, absFull)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return written, fmt.Errorf("refusing to write outside output dir: %s -> %s", tgt, full)
+		}
 		if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
 			return written, err
 		}

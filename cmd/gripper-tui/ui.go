@@ -151,7 +151,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = msg.err
 			return m, tea.Quit
 		}
-		m.resultLines = append(m.resultLines, fmt.Sprintf("Wrote %d files to %s/", msg.written, m.target))
+		m.resultLines = append(m.resultLines, fmt.Sprintf("Wrote %d files to %s", msg.written, dirDisplay(m.target)))
 		m.screen = screenDone
 		return m, tea.Quit
 	case tea.KeyMsg:
@@ -262,9 +262,15 @@ func (m *model) updateReview(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter":
 			val := m.editInput.Value()
 			if m.editingOut {
-				m.target = val
+				m.target = SanitizeOutDir(val)
 			} else {
-				m.selections[m.revCursor].Target = val
+				clean, err := SanitizeTarget(val)
+				if err != nil {
+					m.statusMsg = "Rejected: " + err.Error()
+					m.statusKind = statusError
+				} else {
+					m.selections[m.revCursor].Target = clean
+				}
 			}
 			m.editing = false
 			m.editingOut = false
@@ -370,7 +376,7 @@ func (m *model) updateReview(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.dryRun {
 			m.resultLines = []string{
-				fmt.Sprintf("Would download %d files to %s/:", len(m.selections), m.target),
+				fmt.Sprintf("Would download %d files to %s:", len(m.selections), dirDisplay(m.target)),
 			}
 			for _, s := range m.selections {
 				if s.Source == s.Target {
@@ -580,7 +586,7 @@ func (m *model) viewReview() string {
 	collisions := Collisions(m.selections)
 
 	// Header
-	hdrText := fmt.Sprintf(" gripper · review %d selection(s) · output: %s ", len(m.selections), m.target)
+	hdrText := fmt.Sprintf(" gripper · review %d selection(s) · output: %s ", len(m.selections), dirDisplay(m.target))
 	header := headerStyle.Width(m.width).Render(truncate(hdrText, m.width))
 
 	// Compute column widths
@@ -677,6 +683,21 @@ func (m *model) viewReview() string {
 }
 
 // ---- helpers ----
+
+// dirDisplay returns a user-friendly version of a directory path with a
+// trailing slash. Relative paths are prefixed with "./" for clarity.
+func dirDisplay(d string) string {
+	if d == "" || d == "." {
+		return "./"
+	}
+	if strings.HasPrefix(d, "/") || strings.HasPrefix(d, "./") || strings.HasPrefix(d, "../") || d == ".." {
+		if strings.HasSuffix(d, "/") {
+			return d
+		}
+		return d + "/"
+	}
+	return "./" + d + "/"
+}
 
 func humanSize(s int64) string {
 	const (
