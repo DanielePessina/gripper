@@ -5,7 +5,7 @@
 .idea/
 
 # Go build artifacts
-/bin/gripper-tui
+/bin/gripper
 
 # Claude Code / harness state
 .claude/

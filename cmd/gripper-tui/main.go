@@ -31,7 +31,6 @@ Tree screen:
   →/l              Expand folder
   ←/h              Collapse folder / jump to parent
   space            Toggle selection (cascades to descendants)
-  /                (TODO) Filter
   enter            Go to review screen
   q                Quit
 

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# gripper - interactive picker for selectively downloading files and folders
+# gripper-fzf - fzf-based picker for selectively downloading files and folders
 # from a GitHub repository, without cloning history.
 set -euo pipefail
 
 usage() {
   cat <<'USAGE'
 Usage:
-  gripper <owner/repo|github-url>[#ref] [target-dir] [--force] [--dry-run]
+  gripper-fzf <owner/repo|github-url>[#ref] [target-dir] [--force] [--dry-run]
 
-Interactively pick files and folders from a GitHub repository and download
-them, preserving paths. No git history is fetched.
+fzf-based picker for selectively downloading files and folders from a GitHub
+repository. Use `gripper` for the full collapsible-tree TUI.
 
 Arguments:
   owner/repo[#ref]   Repo slug. Optional #ref (branch, tag, or SHA).
@@ -25,9 +25,9 @@ Auth:
   Uses `gh auth login`. Run `gh auth login` once with the `repo` scope.
 
 Examples:
-  gripper torvalds/linux
-  gripper torvalds/linux#v6.5 ./kernel-stuff/
-  gripper https://github.com/sst/opentui examples/
+  gripper-fzf torvalds/linux
+  gripper-fzf torvalds/linux#v6.5 ./kernel-stuff/
+  gripper-fzf https://github.com/sst/opentui examples/
 USAGE
 }
 
